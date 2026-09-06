@@ -52,6 +52,7 @@ python -m src
 --record-selectors   Dump current Ping/Duo DOM selectors for config
 --no-submit          Dry run: fill creds but don't submit
 --disconnect         Disconnect VPN
+--check-browser      Show (and repair) how Windows opens https links
 -u, --username       VPN username (defaults to the remembered one)
 --config PATH        Custom config file path
 -v, --verbose        Debug logging
@@ -123,9 +124,13 @@ port is cleared.
   "Captured the SAML URL". If nothing was captured, WMI process queries are
   likely blocked; widen `saml_url_regex` or set `hijack_default_browser` to
   true as a last resort.
-- **AnyConnect says "problem navigating to the single sign-on URL"** — set
-  `hijack_default_browser` to `false` in `vpn-config.json` (the default). The
-  next run also repairs the browser association if a crash left it redirected.
+- **AnyConnect says "problem navigating to the single sign-on URL"** — Windows
+  cannot resolve the https association, so AnyConnect never gets as far as a
+  browser. Run `python -m src --check-browser`: it prints the current
+  association and repairs a per-user override this tool left behind (including
+  an empty `HKCU\\Software\\Classes\\ChromeHTML` key, which shadows the real
+  registration). Every normal run repairs it too. Also check that
+  `hijack_default_browser` is `false`.
 - **Login stops with "Duo push was denied"** — nothing else is attempted by
   design; rerun the tool.
 - **Wrong password** — the IdP's own error text is reported and the run stops

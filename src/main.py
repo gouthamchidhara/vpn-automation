@@ -15,7 +15,11 @@ from src.default_browser import resolve_browser_exe
 from src.duo import DuoResult
 from src.saml import fill_password, fill_username, saml_login_with_config
 from src.saml_url import SamlUrlWatcher, capture_saml_url
-from src.url_handler import BrowserUrlHijack, cleanup_stale
+from src.url_handler import (
+    BrowserUrlHijack,
+    describe_association,
+    repair_browser_association,
+)
 from src.banner import accept_banner
 from src.gui import click_connect, connect_via_gui
 from src.logging_config import setup_logging, get_logger
@@ -40,6 +44,9 @@ def cli() -> None:
                         help="Dry run: fill credentials but don't submit (test selectors)")
     parser.add_argument("--disconnect", action="store_true",
                         help="Disconnect the VPN")
+    parser.add_argument("--check-browser", action="store_true",
+                        help="Show how Windows opens https links, and repair it "
+                             "if this tool left the association broken")
     parser.add_argument("--username", "-u", type=str, default=None,
                         help="VPN username (defaults to the remembered one)")
     parser.add_argument("--config", type=str, default=None,
@@ -75,6 +82,14 @@ def cli() -> None:
         VpnCli(vpncli_path=cfg.vpncli_path).disconnect()
         sys.exit(0)
 
+    if args.check_browser:
+        print(describe_association())
+        repaired = repair_browser_association()
+        print(f"Repaired: {', '.join(repaired)}" if repaired
+              else "No repair needed — AnyConnect can open the sign-on URL.")
+        print(describe_association())
+        sys.exit(0)
+
     # ── Full connect flow ────────────────────────────────────────────────────
     if not cfg.vpn_host:
         log.error("VPN host not configured. Edit vpn-config.json or pass --config.")
@@ -103,7 +118,13 @@ def cli() -> None:
     hijack = BrowserUrlHijack(browser_exe, temp_profile, cfg.cdp_port)
     vpn: VpnCli | None = None
     watcher: SamlUrlWatcher | None = None
-    cleanup_stale()
+
+    # AnyConnect opens the sign-on URL through the Windows https association.
+    # Repair it first: a run of this tool that died mid-flight could have left
+    # it pointing at an automated profile, or pointing nowhere at all, and
+    # AnyConnect then fails with "problem navigating to the single sign-on URL".
+    repair_browser_association()
+    log.info("Browser association: %s", describe_association())
 
     try:
         browser.launch()
