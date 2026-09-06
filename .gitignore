@@ -1,0 +1,33 @@
+﻿# Python
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# PyInstaller dist folders
+dist*/
+build*/
+
+# IDE
+.vscode/
+.idea/
+
+# Secrets (never commit)
+vpn-config.json
+*.key
+*.pem
+
+# Browser temp data
+*-browser-*/
+
+# Virtual env
+.venv/
+venv/
+
+# PyInstaller specs
+*.spec
+
+# Pytest
+.pytest_cache/
