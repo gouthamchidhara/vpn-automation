@@ -74,3 +74,23 @@ class TestSaveConfig:
         loaded = load_config(p)
         assert loaded.vpn_host == "vpn.save.test"
         assert loaded.cdp_port == 9444
+
+
+class TestObsoleteSettings:
+    def test_removed_setting_is_ignored(self, tmp_path):
+        """A saved config must not re-enable a feature the code dropped."""
+        p = tmp_path / "config.json"
+        p.write_text(json.dumps({
+            "vpn_host": "vpn.test.com",
+            "hijack_default_browser": True,
+        }), encoding="utf-8")
+        cfg = load_config(p)
+        assert cfg.vpn_host == "vpn.test.com"
+        assert not hasattr(cfg, "hijack_default_browser")
+
+    def test_obsolete_setting_is_reported(self, tmp_path, caplog):
+        p = tmp_path / "config.json"
+        p.write_text(json.dumps({"hijack_default_browser": True}), encoding="utf-8")
+        with caplog.at_level("WARNING"):
+            load_config(p)
+        assert "hijack_default_browser" in caplog.text

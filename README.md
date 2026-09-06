@@ -6,12 +6,11 @@ Automated Cisco AnyConnect + Ping Identity + Duo login tool.
 
 1. Reads your username/password from Windows Credential Manager — no prompts
    once they are stored
-2. Launches your default browser on a clean temp profile with a CDP debug port
-3. Temporarily points the Windows `https://` handler at that instance, so the
-   SAML tab AnyConnect opens lands in the browser the tool can drive (restored
-   on exit)
-4. Starts the AnyConnect GUI and clicks Connect — AnyConnect opens the Ping
-   SAML page
+2. Launches a browser on a clean temp profile with a CDP debug port
+3. Starts the AnyConnect GUI and clicks Connect — AnyConnect opens the Ping
+   SAML page in your normal browser
+4. Captures the sign-on URL AnyConnect used and opens the same page in the
+   automated browser
 5. Fills username + password on the Ping page
 6. Sends the Duo push, prints the verification number Duo shows (when your
    policy uses verified push), and waits for you to approve on your phone
@@ -73,7 +72,6 @@ Edit `vpn-config.json` (created on first `--setup` run) to set:
 | `selectors` | CSS selectors for the login form fields |
 | `duo_selectors` | CSS selectors for the Duo prompt buttons |
 | `use_default_browser` | Automate the OS default browser (recommended) |
-| `hijack_default_browser` | Route the SAML tab into the automated browser |
 | `trust_browser` | Answer Duo's "trust this device" prompt with yes |
 | `*_timeout` | Per-phase timeouts in seconds |
 
@@ -103,15 +101,15 @@ So the launch is left completely alone, and the URL is captured instead:
    was handed during the connect window is used instead (browser start pages
    excluded).
 3. **Tab in our browser.** If the SAML tab does land in the automated browser,
-   it is used directly — this covers `hijack_default_browser`.
+   it is used directly.
 4. **Gateway fallback.** Failing all of that, `https://<vpn_host>/` is opened
    and followed to the IdP.
 
-`hijack_default_browser` (off by default) redirects the default-browser command
-under `HKCU\Software\Classes` to the automated instance. It is the mechanism
-that triggers the AnyConnect error above, so leave it off unless the URL
-capture is blocked in your environment. Any override left behind by a crashed
-run is cleaned up at the next start.
+An earlier version redirected the default-browser command under
+`HKCU\Software\Classes` instead. That is what produced the AnyConnect error
+above, and removing it could leave an empty `ChromeHTML` key that shadows the
+machine-wide registration and breaks every https link. The redirect is gone;
+every run now repairs a per-user registration left behind by those versions.
 
 Your own browser windows are never closed — only a stale listener on the CDP
 port is cleared.
@@ -122,15 +120,14 @@ port is cleared.
   console too; tap it in the Duo app.
 - **"Could not reach the SAML login page"** — run with `-v` and look for
   "Captured the SAML URL". If nothing was captured, WMI process queries are
-  likely blocked; widen `saml_url_regex` or set `hijack_default_browser` to
-  true as a last resort.
+  likely blocked on the machine; widening `saml_url_regex` is the first thing
+  to try.
 - **AnyConnect says "problem navigating to the single sign-on URL"** — Windows
   cannot resolve the https association, so AnyConnect never gets as far as a
-  browser. Run `python -m src --check-browser`: it prints the current
+  browser. Verify with Win+R → `https://example.com`. Run `python -m src --check-browser`: it prints the current
   association and repairs a per-user override this tool left behind (including
   an empty `HKCU\\Software\\Classes\\ChromeHTML` key, which shadows the real
-  registration). Every normal run repairs it too. Also check that
-  `hijack_default_browser` is `false`.
+  registration). Every normal run repairs it too.
 - **Login stops with "Duo push was denied"** — nothing else is attempted by
   design; rerun the tool.
 - **Wrong password** — the IdP's own error text is reported and the run stops

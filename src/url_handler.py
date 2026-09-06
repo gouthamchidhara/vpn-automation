@@ -1,22 +1,18 @@
-"""Temporarily route Windows' https:// handler into our automated browser.
+"""Keep the Windows https:// association healthy for AnyConnect.
 
-AnyConnect opens the SAML page with ShellExecute, which launches the user's
-DEFAULT browser with its DEFAULT profile. Our Playwright-controlled browser
-runs on a separate temp profile (real profiles refuse to bind the CDP port),
-so the SAML tab lands in a window we cannot see — the exact failure where
-"Chrome opened the SAML page and nothing happened".
+AnyConnect opens the SSO page through the Windows https handler, so the
+handler has to resolve to a real browser command. Earlier versions of this
+tool redirected that handler at an automated browser instance; that made
+AnyConnect fail with "Authentication failed due to problem navigating to
+the single sign-on URL", because the redirected command hands the URL to
+the running instance and exits at once, which AnyConnect reads as the
+browser failing to start. Worse, removing the redirect could leave an empty
+HKCU\\Software\\Classes\\<ProgId> key behind, which shadows the machine-wide
+registration and breaks every https link on the machine.
 
-Chrome/Edge treat the profile directory as the single-instance key: launching
-the same exe with the same --user-data-dir hands the URL to the already
-running instance as a new tab. So we don't need to change which browser is
-the default (the UserChoice hash makes that unreliable anyway) — we only
-override the *command* registered for the current ProgId, under
-HKCU\\Software\\Classes, which shadows the machine-wide registration:
-
-    "chrome.exe" --user-data-dir=<temp> --remote-debugging-port=9222 "%1"
-
-The original value is saved and restored on exit; a marker value lets a later
-run clean up an override left behind by a crash.
+The redirect is gone. What remains is the repair: every run removes any
+per-user registration this tool left behind, so a machine damaged by an
+older version heals itself.
 """
 from __future__ import annotations
 import sys
@@ -29,8 +25,10 @@ IS_WINDOWS = sys.platform == "win32"
 
 _USER_CHOICE_KEY = r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\{scheme}\UserChoice"
 _CLASSES = r"Software\Classes"
-_MARKER_VALUE = "VpnAutoLoginShim"      # marks a key we created/modified
-_BACKUP_VALUE = "VpnAutoLoginPrevCmd"   # original command, restored on removal
+# Values an older version wrote alongside its redirect. Still read here so
+# a machine that carries one gets repaired.
+_MARKER_VALUE = "VpnAutoLoginShim"
+_BACKUP_VALUE = "VpnAutoLoginPrevCmd"
 _KNOWN_PROG_IDS = ("ChromeHTML", "MSEdgeHTM", "FirefoxURL")
 
 
@@ -71,78 +69,6 @@ def _read_command(prog_id: str) -> tuple[str | None, bool]:
             return current, marker
     except OSError:
         return None, False
-
-
-class BrowserUrlHijack:
-    """Point the current https ProgId at our automated browser instance.
-
-    Use as a context manager; the registry change is always undone on exit.
-    """
-
-    def __init__(self, browser_exe: str, user_data_dir: str, cdp_port: int,
-                 schemes: tuple[str, ...] = ("https", "http")):
-        self.browser_exe = browser_exe
-        self.user_data_dir = user_data_dir
-        self.cdp_port = cdp_port
-        self.schemes = schemes
-        self._installed: list[str] = []
-
-    @property
-    def command(self) -> str:
-        return (
-            f'"{self.browser_exe}" --user-data-dir="{self.user_data_dir}" '
-            f'--remote-debugging-port={self.cdp_port} --no-first-run '
-            f'--no-default-browser-check "%1"'
-        )
-
-    # ── lifecycle ────────────────────────────────────────────────────────────
-
-    def install(self) -> bool:
-        """Install the override. Returns True if at least one ProgId was set."""
-        if not IS_WINDOWS:
-            log.debug("Not Windows — skipping URL handler override.")
-            return False
-        cleanup_stale()
-        prog_ids = []
-        for scheme in self.schemes:
-            pid = get_prog_id(scheme)
-            if pid and pid not in prog_ids:
-                prog_ids.append(pid)
-        if not prog_ids:
-            log.warning("Could not read the default browser ProgId — "
-                        "AnyConnect's SAML tab may open outside our browser.")
-            return False
-
-        winreg = _winreg()
-        for prog_id in prog_ids:
-            previous, _ = _read_command(prog_id)
-            try:
-                with winreg.CreateKey(winreg.HKEY_CURRENT_USER, _command_key_path(prog_id)) as key:
-                    winreg.SetValueEx(key, "", 0, winreg.REG_SZ, self.command)
-                    winreg.SetValueEx(key, _MARKER_VALUE, 0, winreg.REG_SZ, "1")
-                    # Empty string == "there was nothing here before, delete the key"
-                    winreg.SetValueEx(key, _BACKUP_VALUE, 0, winreg.REG_SZ, previous or "")
-                self._installed.append(prog_id)
-                log.info("Routed %s links into the automated browser (ProgId %s).",
-                         "/".join(self.schemes), prog_id)
-            except OSError as exc:
-                log.warning("Could not override URL handler for %s: %s", prog_id, exc)
-        return bool(self._installed)
-
-    def remove(self) -> None:
-        """Restore the original handler command."""
-        if not IS_WINDOWS:
-            return
-        for prog_id in self._installed:
-            _restore(prog_id)
-        self._installed.clear()
-
-    def __enter__(self) -> "BrowserUrlHijack":
-        self.install()
-        return self
-
-    def __exit__(self, *_exc) -> None:
-        self.remove()
 
 
 def _restore(prog_id: str) -> None:

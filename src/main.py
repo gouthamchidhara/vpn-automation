@@ -15,11 +15,7 @@ from src.default_browser import resolve_browser_exe
 from src.duo import DuoResult
 from src.saml import fill_password, fill_username, saml_login_with_config
 from src.saml_url import SamlUrlWatcher, capture_saml_url
-from src.url_handler import (
-    BrowserUrlHijack,
-    describe_association,
-    repair_browser_association,
-)
+from src.url_handler import describe_association, repair_browser_association
 from src.banner import accept_banner
 from src.gui import click_connect, connect_via_gui
 from src.logging_config import setup_logging, get_logger
@@ -115,7 +111,6 @@ def cli() -> None:
         cdp_port=cfg.cdp_port,
         user_data_dir=temp_profile,
     )
-    hijack = BrowserUrlHijack(browser_exe, temp_profile, cfg.cdp_port)
     vpn: VpnCli | None = None
     watcher: SamlUrlWatcher | None = None
 
@@ -138,14 +133,6 @@ def cli() -> None:
                                  watch_seconds=cfg.ping_page_timeout + 30)
         watcher.snapshot_baseline()
         watcher.start()
-
-        # Opt-in only. Redirecting the default-browser command breaks
-        # AnyConnect's own launch check ("problem navigating to the single
-        # sign-on URL"), so the URL is captured instead of intercepted.
-        if cfg.hijack_default_browser:
-            log.warning("hijack_default_browser is on — if AnyConnect reports a "
-                        "problem navigating to the sign-on URL, turn it off.")
-            hijack.install()
 
         # Phase 3: AnyConnect GUI → Connect. vpncli refuses SAML groups, so the
         # GUI is the only client that can start this handshake.
@@ -203,7 +190,6 @@ def cli() -> None:
     finally:
         if watcher is not None:
             watcher.stop()
-        hijack.remove()
         if vpn is not None:
             vpn.terminate_connect_process()
         browser.close()

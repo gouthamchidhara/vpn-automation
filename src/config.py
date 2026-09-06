@@ -6,6 +6,10 @@ import sys
 from dataclasses import dataclass, field, asdict, fields
 from pathlib import Path
 
+from src.logging_config import get_logger
+
+log = get_logger(__name__)
+
 # When frozen (PyInstaller), __file__ points into a temp extraction dir, so
 # resolve config next to the .exe instead; otherwise use the repo root.
 if getattr(sys, "frozen", False):
@@ -73,14 +77,6 @@ class Config:
     # Prefer the OS default browser exe (Chrome/Edge) over browser_exe, so the
     # automated window is the same browser the IdP already works with.
     use_default_browser: bool = True
-    # OFF by default: pointing the default-browser ProgId command at our
-    # automated instance makes AnyConnect fail with "Authentication failed due
-    # to problem navigating to the single sign-on URL" — the redirected
-    # command hands the URL to the running instance and exits at once, and
-    # AnyConnect treats that as the browser failing to start. The SAML URL is
-    # captured from the launched process instead (see saml_url.py). Only turn
-    # this on if that capture is blocked in your environment.
-    hijack_default_browser: bool = False
     browser_user_data_dir: str = ""             # temp dir created at runtime if empty
 
     # Behaviour
@@ -116,8 +112,17 @@ class Config:
 
 
 def _filter_known(raw: dict, cls) -> dict:
-    """Drop keys that aren't fields of `cls` so an old config file still loads."""
+    """Drop keys that aren't fields of `cls` so an old config file still loads.
+
+    A saved config outlives the code that wrote it, so a setting that has since
+    been removed must not change behaviour — and the user should be told their
+    file still carries it.
+    """
     known = {f.name for f in fields(cls)}
+    unknown = [k for k in raw if k not in known]
+    if unknown:
+        log.warning("Ignoring settings in vpn-config.json that no longer exist: %s",
+                    ", ".join(sorted(unknown)))
     return {k: v for k, v in raw.items() if k in known}
 
 
