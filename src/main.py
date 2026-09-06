@@ -14,7 +14,7 @@ from src.browser import DebugBrowser
 from src.default_browser import resolve_browser_exe
 from src.duo import DuoResult
 from src.saml import fill_password, fill_username, saml_login_with_config
-from src.saml_url import capture_saml_url
+from src.saml_url import SamlUrlWatcher, capture_saml_url
 from src.url_handler import BrowserUrlHijack, cleanup_stale
 from src.banner import accept_banner
 from src.gui import click_connect, connect_via_gui
@@ -102,6 +102,7 @@ def cli() -> None:
     )
     hijack = BrowserUrlHijack(browser_exe, temp_profile, cfg.cdp_port)
     vpn: VpnCli | None = None
+    watcher: SamlUrlWatcher | None = None
     cleanup_stale()
 
     try:
@@ -109,10 +110,20 @@ def cli() -> None:
         browser.connect()
         pre_existing = _open_urls(browser)
 
-        # Phase 2: route ShellExecute'd links into THIS browser instance, so
-        # the SAML tab AnyConnect opens lands in a window we can drive instead
-        # of a second browser we cannot see.
+        # Phase 2: start watching for the browser AnyConnect is about to
+        # launch. It must be running BEFORE Connect: the launcher process
+        # carries the SAML URL and exits within a moment of starting.
+        watcher = SamlUrlWatcher(cfg.saml_url_pattern(),
+                                 watch_seconds=cfg.ping_page_timeout + 30)
+        watcher.snapshot_baseline()
+        watcher.start()
+
+        # Opt-in only. Redirecting the default-browser command breaks
+        # AnyConnect's own launch check ("problem navigating to the single
+        # sign-on URL"), so the URL is captured instead of intercepted.
         if cfg.hijack_default_browser:
+            log.warning("hijack_default_browser is on — if AnyConnect reports a "
+                        "problem navigating to the sign-on URL, turn it off.")
             hijack.install()
 
         # Phase 3: AnyConnect GUI → Connect. vpncli refuses SAML groups, so the
@@ -123,7 +134,8 @@ def cli() -> None:
             sys.exit(1)
 
         # Phase 4: get hold of the SAML login tab.
-        page = _acquire_saml_page(browser, cfg, pre_existing)
+        page = _acquire_saml_page(browser, cfg, pre_existing, watcher)
+        watcher.stop()
         if page is None:
             log.error("The SAML login page never reached the automated browser.")
             print("\n❌ Could not reach the SAML login page. Run with -v for details.",
@@ -168,6 +180,8 @@ def cli() -> None:
         log.error("Unexpected error: %s", exc, exc_info=True)
         sys.exit(1)
     finally:
+        if watcher is not None:
+            watcher.stop()
         hijack.remove()
         if vpn is not None:
             vpn.terminate_connect_process()
@@ -187,24 +201,32 @@ def _open_urls(browser: DebugBrowser) -> set[str]:
     return urls
 
 
-def _acquire_saml_page(browser: DebugBrowser, cfg: Config, pre_existing: set[str]):
+def _acquire_saml_page(browser: DebugBrowser, cfg: Config, pre_existing: set[str],
+                       watcher: SamlUrlWatcher | None = None):
     """Return the page showing the SAML login, however it got opened.
 
-    Three ways, in order of reliability:
-      1. AnyConnect's tab landed in our browser (the URL-handler override).
-      2. It went to another browser — recover the URL from that process's
-         command line and load it here.
-      3. Nothing found: drive the gateway URL ourselves and let it redirect.
+    Two things are racing, and either one is a win:
+      * the URL watcher sees the browser AnyConnect launched, and we load that
+        exact URL in the browser we drive (the normal path);
+      * the tab lands in our browser directly (when the user's default browser
+        already is our instance, or the opt-in handler override is on).
+
+    If neither turns up, fall back to driving the gateway URL ourselves.
     """
     log = get_logger("vpn-auto-login")
 
-    page = _wait_for_new_tab(browser, cfg, pre_existing, timeout=cfg.ping_page_timeout)
+    url, page = _race_url_and_tab(browser, cfg, pre_existing, watcher,
+                                  timeout=cfg.ping_page_timeout)
     if page is not None:
         return page
+    if url:
+        try:
+            return browser.open_url(url)
+        except Exception as exc:
+            log.error("Could not load the captured SAML URL: %s", exc)
 
-    log.warning("No SAML tab appeared in the automated browser — "
-                "looking for the URL AnyConnect opened elsewhere.")
-    url = capture_saml_url(cfg.saml_url_pattern(), timeout=20)
+    log.warning("No SAML tab or URL seen — scanning the process table once more.")
+    url = capture_saml_url(cfg.saml_url_pattern(), timeout=10)
     if url:
         try:
             return browser.open_url(url)
@@ -223,6 +245,40 @@ def _acquire_saml_page(browser: DebugBrowser, cfg: Config, pre_existing: set[str
     return page
 
 
+def _race_url_and_tab(browser: DebugBrowser, cfg: Config, pre_existing: set[str],
+                      watcher: SamlUrlWatcher | None, timeout: int):
+    """Wait for whichever arrives first: the captured URL, or a login tab."""
+    log = get_logger("vpn-auto-login")
+    login_pattern = re.compile(cfg.login_page_regex(), re.IGNORECASE)
+    deadline = time.monotonic() + timeout
+    fallback_tab = None
+    while time.monotonic() < deadline:
+        if watcher is not None:
+            url = watcher.url
+            if url:
+                log.info("Loading the SAML URL AnyConnect opened in the automated browser.")
+                return url, None
+
+        page = _scan_tabs(browser, pre_existing, login_pattern, cfg)
+        if page is not None:
+            return None, page
+        fallback_tab = fallback_tab or _first_new_tab(browser, pre_existing)
+        time.sleep(1)
+
+    if watcher is not None:
+        watcher.poll_once()
+        # Nothing matched saml_url_regex; a URL a browser was handed during the
+        # connect is still far better than guessing at the gateway.
+        late = watcher.url or watcher.fallback_url
+        if late:
+            log.info("Using the URL opened during the connect: %s", late)
+            return late, None
+    if fallback_tab is not None:
+        log.warning("Using the only new tab that opened: %s", _url_of(fallback_tab))
+        _focus(fallback_tab)
+    return None, fallback_tab
+
+
 def _wait_for_new_tab(browser: DebugBrowser, cfg: Config, pre_existing: set[str], timeout: int):
     """Wait for a tab that is neither blank nor one that was already open.
 
@@ -235,30 +291,50 @@ def _wait_for_new_tab(browser: DebugBrowser, cfg: Config, pre_existing: set[str]
     deadline = time.monotonic() + timeout
     fallback = None
     while time.monotonic() < deadline:
-        for page in browser.pages():
-            try:
-                url = page.url
-            except Exception:
-                continue
-            if _BLANK_URLS.search(url) or url in pre_existing:
-                continue
-            if login_pattern.search(url):
-                log.info("SAML tab opened in the automated browser: %s", url)
-                _focus(page)
-                return page
-            # Unknown host: accept it once it actually shows a login form —
-            # it may still be mid-redirect towards the IdP.
-            if _has_login_form(page, cfg):
-                log.info("Login form found in the automated browser: %s", url)
-                _focus(page)
-                return page
-            fallback = fallback or page
+        page = _scan_tabs(browser, pre_existing, login_pattern, cfg)
+        if page is not None:
+            return page
+        fallback = fallback or _first_new_tab(browser, pre_existing)
         time.sleep(1)
 
     if fallback is not None:
         log.warning("Using the only new tab that opened: %s", _url_of(fallback))
         _focus(fallback)
     return fallback
+
+
+def _scan_tabs(browser: DebugBrowser, pre_existing: set[str],
+               login_pattern: re.Pattern[str], cfg: Config):
+    """Return a tab already showing the IdP, Duo, or any login form."""
+    log = get_logger("vpn-auto-login")
+    for page in _new_tabs(browser, pre_existing):
+        url = _url_of(page)
+        if login_pattern.search(url):
+            log.info("SAML tab opened in the automated browser: %s", url)
+            _focus(page)
+            return page
+        # Unknown host: accept it once it actually shows a login form — it may
+        # still be mid-redirect towards the IdP.
+        if _has_login_form(page, cfg):
+            log.info("Login form found in the automated browser: %s", url)
+            _focus(page)
+            return page
+    return None
+
+
+def _first_new_tab(browser: DebugBrowser, pre_existing: set[str]):
+    for page in _new_tabs(browser, pre_existing):
+        return page
+    return None
+
+
+def _new_tabs(browser: DebugBrowser, pre_existing: set[str]):
+    """Tabs that are neither blank nor already open before the connect."""
+    for page in browser.pages():
+        url = _url_of(page)
+        if url == "<closed>" or _BLANK_URLS.search(url) or url in pre_existing:
+            continue
+        yield page
 
 
 def _has_login_form(page, cfg: Config) -> bool:

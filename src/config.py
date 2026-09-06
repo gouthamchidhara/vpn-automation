@@ -70,13 +70,17 @@ class Config:
     # Browser
     cdp_port: int = 9222
     browser_exe: str = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
-    # Prefer the OS default browser exe (Chrome/Edge) over browser_exe. The
-    # default browser is what AnyConnect's ShellExecute launches, so driving
-    # the same binary lets the SAML tab land in the window we control.
+    # Prefer the OS default browser exe (Chrome/Edge) over browser_exe, so the
+    # automated window is the same browser the IdP already works with.
     use_default_browser: bool = True
-    # Temporarily point the default-browser ProgId command at our automated
-    # instance so AnyConnect's SAML tab opens inside it. Restored on exit.
-    hijack_default_browser: bool = True
+    # OFF by default: pointing the default-browser ProgId command at our
+    # automated instance makes AnyConnect fail with "Authentication failed due
+    # to problem navigating to the single sign-on URL" — the redirected
+    # command hands the URL to the running instance and exits at once, and
+    # AnyConnect treats that as the browser failing to start. The SAML URL is
+    # captured from the launched process instead (see saml_url.py). Only turn
+    # this on if that capture is blocked in your environment.
+    hijack_default_browser: bool = False
     browser_user_data_dir: str = ""             # temp dir created at runtime if empty
 
     # Behaviour

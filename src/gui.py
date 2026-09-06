@@ -73,11 +73,13 @@ def click_connect(attempts: int = 2, vpnui_path: str | None = None) -> bool:
         try:
             connect_btn = _find_connect_button(window)
             if connect_btn is not None:
-                connect_btn.click()
-                log.info("Clicked Connect in AnyConnect GUI.")
-                return True
-            log.info("No Connect button on screen (attempt %d/%d) — "
-                     "AnyConnect may already be connecting.", attempt + 1, attempts)
+                if _press(connect_btn):
+                    log.info("Clicked Connect in AnyConnect GUI.")
+                    return True
+                log.warning("Connect attempt %d could not activate the button.", attempt + 1)
+            else:
+                log.info("No Connect button on screen (attempt %d/%d) — "
+                         "AnyConnect may already be connecting.", attempt + 1, attempts)
         except Exception as exc:
             log.warning("Connect attempt %d failed: %s", attempt + 1, exc)
         time.sleep(1)
@@ -85,6 +87,24 @@ def click_connect(attempts: int = 2, vpnui_path: str | None = None) -> bool:
     log.error("Could not find the Connect button after %d attempts.", attempts)
     if window is not None:
         _dump_controls(window)
+    return False
+
+
+def _press(control) -> bool:
+    """Activate a control, falling back to a real mouse click.
+
+    AnyConnect's Connect button often refuses the UI Automation Invoke pattern
+    while the window is still painting (0x80040200), but a physical click on
+    its rectangle always lands.
+    """
+    for attempt in (control.click, getattr(control, "click_input", None)):
+        if attempt is None:
+            continue
+        try:
+            attempt()
+            return True
+        except Exception as exc:
+            log.debug("Control activation via %s failed: %s", attempt.__name__, exc)
     return False
 
 

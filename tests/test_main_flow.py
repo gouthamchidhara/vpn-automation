@@ -3,7 +3,13 @@ from unittest.mock import MagicMock, patch
 
 from src.config import Config
 from src.duo import DuoOutcome, DuoResult
-from src.main import _acquire_saml_page, _finish_connect, _report_auth_failure, _wait_for_new_tab
+from src.main import (
+    _acquire_saml_page,
+    _finish_connect,
+    _race_url_and_tab,
+    _report_auth_failure,
+    _wait_for_new_tab,
+)
 from src.vpn import VpnState
 
 
@@ -66,6 +72,43 @@ class TestWaitForNewTab:
         assert _wait_for_new_tab(_browser([odd]), cfg, set(), timeout=1) is odd
 
 
+class TestRaceUrlAndTab:
+    def test_captured_url_wins_when_the_tab_went_elsewhere(self):
+        """The normal path: AnyConnect opened its own browser, we took the URL."""
+        cfg = Config(ping_page_timeout=5)
+        watcher = MagicMock()
+        watcher.url = "https://auth.example.com/idp/SSO.saml2"
+        url, page = _race_url_and_tab(_browser([]), cfg, set(), watcher, timeout=5)
+        assert url == "https://auth.example.com/idp/SSO.saml2"
+        assert page is None
+
+    def test_tab_wins_when_it_lands_in_our_browser(self):
+        cfg = Config(ping_host_regex=r"auth\.example\.com")
+        watcher = MagicMock()
+        watcher.url = None
+        saml = _page("https://auth.example.com/idp/SSO.saml2")
+        url, page = _race_url_and_tab(_browser([saml]), cfg, set(), watcher, timeout=5)
+        assert page is saml
+        assert url is None
+
+    @patch("src.main.time.sleep")
+    def test_falls_back_to_a_late_poll(self, _sleep):
+        """Watcher missed the event; a direct scan still finds the URL."""
+        cfg = Config()
+        watcher = MagicMock()
+        watcher.url = None
+        watcher.poll_once.return_value = "https://auth.example.com/idp/SSO.saml2"
+
+        def poll():
+            watcher.url = "https://auth.example.com/idp/SSO.saml2"
+            return watcher.url
+
+        watcher.poll_once.side_effect = poll
+        url, page = _race_url_and_tab(_browser([]), cfg, set(), watcher, timeout=1)
+        assert url == "https://auth.example.com/idp/SSO.saml2"
+        assert page is None
+
+
 class TestAcquireSamlPage:
     @patch("src.main.capture_saml_url")
     def test_uses_the_tab_when_it_lands_in_our_browser(self, mock_capture):
@@ -76,15 +119,28 @@ class TestAcquireSamlPage:
         mock_capture.assert_not_called()
 
     @patch("src.main.time.sleep")
-    @patch("src.main.capture_saml_url", return_value="https://auth.example.com/idp/SSO.saml2?x=1")
-    def test_recovers_the_url_from_another_browser(self, mock_capture, _sleep):
+    @patch("src.main.capture_saml_url")
+    def test_loads_the_watched_url_in_our_browser(self, mock_capture, _sleep):
         """The reported failure: the SAML page opened in a browser we don't drive."""
         cfg = Config(vpn_host="vpn.example.com", ping_page_timeout=1)
+        watcher = MagicMock()
+        watcher.url = "https://auth.example.com/idp/SSO.saml2?x=1"
         browser = _browser([])
         recovered = _page("https://auth.example.com/idp/SSO.saml2?x=1")
         browser.open_url.return_value = recovered
-        assert _acquire_saml_page(browser, cfg, set()) is recovered
+        assert _acquire_saml_page(browser, cfg, set(), watcher) is recovered
         browser.open_url.assert_called_once_with("https://auth.example.com/idp/SSO.saml2?x=1")
+        mock_capture.assert_not_called()
+
+    @patch("src.main.time.sleep")
+    @patch("src.main.capture_saml_url", return_value="https://auth.example.com/idp/SSO.saml2?x=2")
+    def test_recovers_the_url_without_a_watcher(self, mock_capture, _sleep):
+        cfg = Config(vpn_host="vpn.example.com", ping_page_timeout=1)
+        browser = _browser([])
+        recovered = _page("https://auth.example.com/idp/SSO.saml2?x=2")
+        browser.open_url.return_value = recovered
+        assert _acquire_saml_page(browser, cfg, set()) is recovered
+        browser.open_url.assert_called_once_with("https://auth.example.com/idp/SSO.saml2?x=2")
 
     @patch("src.main.time.sleep")
     @patch("src.main.capture_saml_url", return_value=None)

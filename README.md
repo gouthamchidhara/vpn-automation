@@ -85,18 +85,32 @@ recognise the page faster.
 AnyConnect opens the SAML URL with `ShellExecute`, which always launches your
 *default* browser with its *default* profile — a window Playwright cannot
 attach to (Chrome/Edge 136+ refuse `--remote-debugging-port` on the default
-profile directory). Three mechanisms, in order:
+profile directory). AnyConnect also watches the browser it launched, so
+redirecting that launch makes it fail with **"Authentication failed due to
+problem navigating to the single sign-on URL"**.
 
-1. **Handler override.** `HKCU\Software\Classes\<ProgId>\shell\open\command` is
-   pointed at the same exe with our `--user-data-dir`. Chromium treats the
-   profile directory as its single-instance key, so the URL is handed to the
-   already-running automated instance as a new tab. The original command is
-   saved and restored on exit; a leftover from a crashed run is cleaned up at
-   the next start.
-2. **Command-line recovery.** If the override does not take, the URL is read
-   from the other browser's process command line and loaded here instead.
-3. **Gateway fallback.** Failing both, the tool opens `https://<vpn_host>/` and
-   follows the redirect to the IdP.
+So the launch is left completely alone, and the URL is captured instead:
+
+1. **URL watcher (primary).** Before Connect is clicked, a watcher records the
+   URLs already on browser command lines, then subscribes to process-creation
+   events and polls the process table. The browser AnyConnect launches carries
+   the SSO URL as an argument; that exact URL is then loaded in the automated
+   browser. The tab AnyConnect opened in your normal browser is left where it
+   is — AnyConnect keeps watching that process, and only one of the two tabs
+   completes the handshake.
+2. **New-URL fallback.** If nothing matches `saml_url_regex`, any URL a browser
+   was handed during the connect window is used instead (browser start pages
+   excluded).
+3. **Tab in our browser.** If the SAML tab does land in the automated browser,
+   it is used directly — this covers `hijack_default_browser`.
+4. **Gateway fallback.** Failing all of that, `https://<vpn_host>/` is opened
+   and followed to the IdP.
+
+`hijack_default_browser` (off by default) redirects the default-browser command
+under `HKCU\Software\Classes` to the automated instance. It is the mechanism
+that triggers the AnyConnect error above, so leave it off unless the URL
+capture is blocked in your environment. Any override left behind by a crashed
+run is cleaned up at the next start.
 
 Your own browser windows are never closed — only a stale listener on the CDP
 port is cleared.
@@ -105,9 +119,13 @@ port is cleared.
 
 - **Duo shows a number but nothing happens** — the number is printed in the
   console too; tap it in the Duo app.
-- **"Could not reach the SAML login page"** — run with `-v` and check whether
-  the handler override installed; a locked-down HKCU falls back to the
-  command-line recovery.
+- **"Could not reach the SAML login page"** — run with `-v` and look for
+  "Captured the SAML URL". If nothing was captured, WMI process queries are
+  likely blocked; widen `saml_url_regex` or set `hijack_default_browser` to
+  true as a last resort.
+- **AnyConnect says "problem navigating to the single sign-on URL"** — set
+  `hijack_default_browser` to `false` in `vpn-config.json` (the default). The
+  next run also repairs the browser association if a crash left it redirected.
 - **Login stops with "Duo push was denied"** — nothing else is attempted by
   design; rerun the tool.
 - **Wrong password** — the IdP's own error text is reported and the run stops
