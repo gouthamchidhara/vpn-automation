@@ -1,7 +1,6 @@
 """Cisco AnyConnect vpncli.exe subprocess control."""
 from __future__ import annotations
 import subprocess
-import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -10,6 +9,9 @@ from enum import Enum
 from src.logging_config import get_logger
 
 log = get_logger(__name__)
+
+# CREATE_NO_WINDOW only exists on Windows; 0 means "no extra flags" elsewhere.
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 # vpncli prompts (banner/certificate accept) that must be auto-answered "y"
 # so the interactive process doesn't stall before it can launch the SAML browser.
@@ -38,7 +40,7 @@ class VpnCli:
                 capture_output=True,
                 text=True,
                 timeout=timeout,
-                creationflags=subprocess.CREATE_NO_WINDOW,
+                creationflags=_NO_WINDOW,
             )
             return result.stdout + result.stderr
         except subprocess.TimeoutExpired:
@@ -68,7 +70,7 @@ class VpnCli:
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
-                creationflags=subprocess.CREATE_NO_WINDOW,
+                creationflags=_NO_WINDOW,
             )
         except FileNotFoundError:
             log.error("vpncli.exe not found at %s", self.vpncli_path)
@@ -82,7 +84,7 @@ class VpnCli:
         result = subprocess.run(
             ["taskkill", "/F", "/IM", "vpnui.exe"],
             capture_output=True, text=True, timeout=10,
-            creationflags=subprocess.CREATE_NO_WINDOW,
+            creationflags=_NO_WINDOW,
         )
         if "SUCCESS" in result.stdout.upper():
             log.info("Closed running AnyConnect GUI (vpnui.exe).")
@@ -147,18 +149,27 @@ def parse_state(output: str) -> VpnState:
     return VpnState.UNKNOWN
 
 
-def wait_for_connected(cli: VpnCli, timeout: int = 60) -> VpnState:
-    """Poll vpncli state until Connected or timeout."""
-    deadline = time.monotonic() + timeout
+def wait_for_connected(cli: VpnCli, timeout: int = 90, grace: int = 25) -> VpnState:
+    """Poll vpncli state until Connected or timeout.
+
+    Right after the SAML callback the client still reports Disconnected for a
+    few seconds while it builds the tunnel, so an early Disconnected reading is
+    not a failure. It only counts as one once the grace period has passed.
+    """
+    start = time.monotonic()
+    deadline = start + timeout
+    last = VpnState.UNKNOWN
     while time.monotonic() < deadline:
         st = cli.state()
-        log.info("VPN state: %s", st.value)
+        if st != last:
+            log.info("VPN state: %s", st.value)
+            last = st
         if st == VpnState.CONNECTED:
             return st
-        if st == VpnState.DISCONNECTED:
-            # Could mean auth failed
-            log.error("VPN reports Disconnected during wait — auth may have failed.")
+        if st == VpnState.DISCONNECTED and (time.monotonic() - start) > grace:
+            # Settled on Disconnected well after auth — the tunnel was refused.
+            log.error("VPN reports Disconnected after authentication — connection refused.")
             return st
         time.sleep(3)
     log.error("Timed out waiting for Connected after %ds.", timeout)
-    return VpnState.UNKNOWN
+    return last if last != VpnState.UNKNOWN else VpnState.UNKNOWN

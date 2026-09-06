@@ -19,7 +19,7 @@ class TestConfig:
         cfg = Config()
         assert cfg.cdp_port == 9222
         assert cfg.duo_wait_timeout == 120
-        assert cfg.connected_timeout == 60
+        assert cfg.connected_timeout == 90
         assert "Cisco" in cfg.vpncli_path
         assert "Cisco" in cfg.vpnui_path
         assert "Edge" in cfg.browser_exe or "msedge" in cfg.browser_exe

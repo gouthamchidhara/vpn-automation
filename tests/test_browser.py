@@ -28,12 +28,24 @@ class TestDebugBrowser:
         mock_proc = MagicMock()
         mock_proc.pid = 12345
         mock_popen.return_value = mock_proc
-        b = DebugBrowser(browser_exe=r"C:\msedge.exe", cdp_port=9222)
+        b = DebugBrowser(browser_exe=r"C:\msedge.exe", cdp_port=9222, user_data_dir="C:\\tmp\\p")
         b.launch()
         mock_popen.assert_called_once()
         cmd = mock_popen.call_args[0][0]
         assert "--remote-debugging-port=9222" in cmd
+        assert "--user-data-dir=C:\\tmp\\p" in cmd
         assert b._process == mock_proc
+
+    @patch("src.browser.subprocess.run")
+    @patch("src.browser.subprocess.Popen")
+    @patch("src.browser.DebugBrowser._wait_for_port", side_effect=[False, True])
+    def test_launch_does_not_kill_the_users_browser(self, mock_wait, mock_popen, mock_run):
+        """We drive the default browser, so a blanket taskkill would close the
+        user's real windows. Only a stale listener on our port may be killed."""
+        b = DebugBrowser(browser_exe=r"C:\chrome.exe", cdp_port=9222)
+        b.launch()
+        for call_args in mock_run.call_args_list:
+            assert "/IM" not in call_args[0][0]
 
     @patch("src.browser.sync_playwright")
     def test_connect(self, mock_pw_mod):

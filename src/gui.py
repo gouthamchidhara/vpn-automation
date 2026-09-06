@@ -6,6 +6,7 @@ initiate this connection. Once Connect is clicked, AnyConnect still opens the
 external SAML browser tab exactly as it would for a manual click.
 """
 from __future__ import annotations
+import re
 import subprocess
 import time
 
@@ -13,8 +14,10 @@ from src.logging_config import get_logger
 
 log = get_logger(__name__)
 
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 _MAIN_TITLE = "cisco anyconnect secure mobility client"
+_CONNECT_RE = re.compile(r"^connect$|^connect\b", re.IGNORECASE)
 
 
 def connect_via_gui(vpnui_path: str, profile_name: str, launch_wait: int = 10) -> bool:
@@ -24,18 +27,9 @@ def connect_via_gui(vpnui_path: str, profile_name: str, launch_wait: int = 10) -
     # confuses window matching, so clear it before doing anything else.
     _cancel_stale_auth_dialogs()
 
-    window = _find_main_window()
+    window = _open_main_window(vpnui_path, launch_wait)
     if window is None:
-        log.info("Launching AnyConnect GUI: %s", vpnui_path)
-        try:
-            subprocess.Popen([vpnui_path], creationflags=subprocess.CREATE_NO_WINDOW)
-        except FileNotFoundError:
-            log.error("vpnui.exe not found at %s", vpnui_path)
-            return False
-        window = _wait_for_main_window(launch_wait)
-        if window is None:
-            log.error("AnyConnect GUI window did not appear within %ds.", launch_wait)
-            return False
+        return False
 
     window.set_focus()
 
@@ -54,25 +48,61 @@ def connect_via_gui(vpnui_path: str, profile_name: str, launch_wait: int = 10) -
     # Selecting the profile refreshes the window's UI Automation tree —
     # re-fetch a fresh reference and retry the Connect button search.
     time.sleep(1)
-    window = _find_main_window() or window
+    return click_connect(attempts=3)
 
-    for attempt in range(3):
+
+def click_connect(attempts: int = 2, vpnui_path: str | None = None) -> bool:
+    """Click Connect in the AnyConnect GUI. Used to start and to resume a login.
+
+    After Duo approves, some profiles hand control back to the GUI sitting on
+    "Ready to connect" — this presses Connect again so the tunnel actually
+    comes up.
+    """
+    window = None
+    for attempt in range(attempts):
+        window = _find_main_window()
+        if window is None and vpnui_path:
+            window = _open_main_window(vpnui_path, launch_wait=10)
+        if window is None:
+            time.sleep(1)
+            continue
+        try:
+            window.set_focus()
+        except Exception:
+            pass
         try:
             connect_btn = _find_connect_button(window)
             if connect_btn is not None:
                 connect_btn.click()
                 log.info("Clicked Connect in AnyConnect GUI.")
                 return True
+            log.info("No Connect button on screen (attempt %d/%d) — "
+                     "AnyConnect may already be connecting.", attempt + 1, attempts)
         except Exception as exc:
             log.warning("Connect attempt %d failed: %s", attempt + 1, exc)
-        # Re-fetch window and retry
         time.sleep(1)
-        window = _find_main_window() or window
 
-    # Last resort: dump all controls for debugging
-    log.error("Could not find Connect button after 3 attempts.")
-    _dump_controls(window)
+    log.error("Could not find the Connect button after %d attempts.", attempts)
+    if window is not None:
+        _dump_controls(window)
     return False
+
+
+def _open_main_window(vpnui_path: str, launch_wait: int):
+    """Return the AnyConnect main window, launching the GUI if needed."""
+    window = _find_main_window()
+    if window is not None:
+        return window
+    log.info("Launching AnyConnect GUI: %s", vpnui_path)
+    try:
+        subprocess.Popen([vpnui_path], creationflags=_NO_WINDOW)
+    except FileNotFoundError:
+        log.error("vpnui.exe not found at %s", vpnui_path)
+        return None
+    window = _wait_for_main_window(launch_wait)
+    if window is None:
+        log.error("AnyConnect GUI window did not appear within %ds.", launch_wait)
+    return window
 
 
 def _cancel_stale_auth_dialogs() -> None:
@@ -115,21 +145,25 @@ def _wait_for_main_window(timeout: int):
     return None
 
 
+def is_connect_text(text: str) -> bool:
+    """True for the Connect button's label, false for Disconnect."""
+    cleaned = (text or "").replace("&", "").strip()
+    if "disconnect" in cleaned.lower():
+        return False
+    return bool(_CONNECT_RE.match(cleaned))
+
+
 def _find_connect_button(window):
-    """Match the Connect button — try multiple strategies."""
-    import re
-    pattern = re.compile(r"connect", re.IGNORECASE)
-    # Strategy 1: Button controls with "connect" in text
+    """Match the Connect button — never Disconnect, never the 'Connect to:' label."""
+    # Strategy 1: Button controls labelled Connect
     for ctrl in window.descendants(control_type="Button"):
-        text = ctrl.window_text().replace("&", "").strip()
-        if pattern.search(text):
+        if is_connect_text(ctrl.window_text()):
             return ctrl
-    # Strategy 2: any clickable control with "connect" in automation_id or name
+    # Strategy 2: any invokable control whose automation id names the connect action
     for ctrl in window.descendants():
         try:
-            name = (ctrl.element_info.name or "").replace("&", "").strip()
             aid = getattr(ctrl.element_info, "automation_id", "") or ""
-            if pattern.search(name) or pattern.search(aid):
+            if is_connect_text(aid) or aid.lower() in ("connectbutton", "btnconnect"):
                 return ctrl
         except Exception:
             continue

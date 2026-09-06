@@ -1,34 +1,38 @@
-"""Detect and temporarily override the OS default browser.
+"""Detect the OS default browser.
 
 AnyConnect opens SAML links via Windows ShellExecute, which always launches
-the user's DEFAULT browser — not whatever browser_exe happens to be in
-config. If we launch a different browser for CDP control, the SAML tab opens
-in an untracked process and our automation never sees it.
+the user's DEFAULT browser. Driving that same binary (on our own temp profile)
+is what lets `url_handler` route the SAML tab into the window we control, so
+the default browser's exe — not a hardcoded Edge path — is the right one to
+automate.
 
-Solution: temporarily set Edge as the default browser before triggering the
-VPN connect, then restore the original default on exit.
+Note: we deliberately do NOT rewrite the UserChoice key to change which
+browser is the default. Windows 10/11 protect it with a per-user hash, so
+writing ProgId alone either gets reverted or leaves the user with a broken
+association. `url_handler` overrides the launch command of the existing
+default instead.
 """
 from __future__ import annotations
 import os
 import re
-import subprocess
-import winreg
+import sys
 
 from src.logging_config import get_logger
 
 log = get_logger(__name__)
 
-_REG_KEY = r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice"
-_EDGE_PROG_ID = "MSEdgeHTM"
+IS_WINDOWS = sys.platform == "win32"
 
-# Known browser prog IDs -> exe path commands in HKCR
-_BROWSER_COMMANDS = {
-    "ChromeHTML": r"Google\Chrome\Application\chrome.exe",
-    "MSEdgeHTM":  r"Microsoft\Edge\Application\msedge.exe",
-}
+_REG_KEY = r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice"
+
+# Browsers we can drive over CDP
+_CHROMIUM_EXES = ("chrome.exe", "msedge.exe", "brave.exe", "vivaldi.exe", "opera.exe")
 
 
 def _get_prog_id() -> str | None:
+    if not IS_WINDOWS:
+        return None
+    import winreg
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _REG_KEY) as key:
             return winreg.QueryValueEx(key, "ProgId")[0]
@@ -37,6 +41,9 @@ def _get_prog_id() -> str | None:
 
 
 def _get_exe_from_prog_id(prog_id: str) -> str | None:
+    if not IS_WINDOWS:
+        return None
+    import winreg
     try:
         with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, fr"{prog_id}\shell\open\command") as key:
             command = winreg.QueryValueEx(key, "")[0]
@@ -52,39 +59,23 @@ def get_default_browser_exe() -> str | None:
     return _get_exe_from_prog_id(prog_id) if prog_id else None
 
 
-def set_default_browser(exe_path: str) -> bool:
-    """Set the default HTTPS browser via registry.
+def is_chromium(exe_path: str) -> bool:
+    """True if the exe is a Chromium-based browser we can drive over CDP."""
+    return os.path.basename(exe_path).lower() in _CHROMIUM_EXES
 
-    Uses the well-known prog ID for the given exe. Works on Windows 10/11
-    but may be overridden by OS defaults app UI in some builds.
-    Returns True if the registry write succeeded.
+
+def resolve_browser_exe(configured_exe: str, prefer_default: bool = True) -> str:
+    """Pick the browser to automate: the OS default when usable, else config.
+
+    Falling back to the configured exe keeps things working when the default
+    browser is Firefox (no CDP) or cannot be read from the registry.
     """
-    exe_name = os.path.basename(exe_path).lower()
-    if "msedge" in exe_name:
-        prog_id = "MSEdgeHTM"
-    elif "chrome" in exe_name:
-        prog_id = "ChromeHTML"
-    else:
-        log.error("Unsupported browser for default switch: %s", exe_path)
-        return False
-
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _REG_KEY, 0, winreg.KEY_SET_VALUE) as key:
-            winreg.SetValueEx(key, "ProgId", 0, winreg.REG_SZ, prog_id)
-        log.info("Set default browser to %s (ProgId=%s).", exe_name, prog_id)
-        return True
-    except OSError as exc:
-        log.warning("Failed to set default browser: %s", exc)
-        return False
-
-
-def restore_default_browser(original_exe: str | None) -> None:
-    """Restore the original default browser if we changed it."""
-    if not original_exe:
-        return
-    exe_name = os.path.basename(original_exe).lower()
-    if "msedge" in exe_name:
-        # Already Edge — nothing to restore
-        return
-    set_default_browser(original_exe)
-    log.info("Restored default browser to %s.", os.path.basename(original_exe))
+    if prefer_default:
+        default_exe = get_default_browser_exe()
+        if default_exe and is_chromium(default_exe) and os.path.exists(default_exe):
+            log.info("Automating the default browser: %s", os.path.basename(default_exe))
+            return default_exe
+        if default_exe:
+            log.info("Default browser (%s) can't be automated — using %s instead.",
+                     os.path.basename(default_exe), os.path.basename(configured_exe))
+    return configured_exe

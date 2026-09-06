@@ -1,25 +1,38 @@
 """Launch browser with CDP debug port, attach via Playwright."""
 from __future__ import annotations
-import shutil
+import re
 import socket
 import subprocess
 import tempfile
 import time
-from pathlib import Path
 
-from playwright.sync_api import sync_playwright, Browser, BrowserContext, Page
+from playwright.sync_api import (
+    Error as PlaywrightError,
+    Browser,
+    BrowserContext,
+    Page,
+    sync_playwright,
+)
 
 from src.logging_config import get_logger
 
 log = get_logger(__name__)
+
+# CREATE_NO_WINDOW only exists on Windows; 0 means "no extra flags" elsewhere.
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 class DebugBrowser:
     """Manages a CDP-debuggable browser instance using a TEMP profile.
 
     Real browser profiles (Chrome/Edge with 40+ tabs, extensions, startup
-    boost) consistently fail to bind the CDP debug port. A clean temp profile
-    starts in <2 seconds with no interference.
+    boost) consistently fail to bind the CDP debug port — since Chrome 136 the
+    default profile directory refuses --remote-debugging-port outright. A clean
+    temp profile starts in <2 seconds with no interference.
+
+    The profile directory doubles as the single-instance key: anything else
+    launched with the same --user-data-dir (see `url_handler`) hands its URL to
+    this instance as a new tab, which is how AnyConnect's SAML page reaches us.
     """
 
     def __init__(
@@ -44,14 +57,13 @@ class DebugBrowser:
 
     def launch(self) -> None:
         """Start browser with remote debugging enabled on a temp profile."""
-        exe_name = Path(self.browser_exe).name
-        # Kill any lingering instances that might hold the port
-        subprocess.run(
-            ["taskkill", "/F", "/IM", exe_name],
-            capture_output=True, timeout=10,
-            creationflags=subprocess.CREATE_NO_WINDOW,
-        )
-        time.sleep(1)
+        # Free the debug port if a previous run left something on it. Only that
+        # process is killed — the user's own browser windows (a different
+        # profile, no debug port) are left alone.
+        if self._wait_for_port(self.cdp_port, timeout=1):
+            log.info("CDP port %d is busy — clearing the stale listener.", self.cdp_port)
+            self._kill_debug_port_processes()
+            time.sleep(1)
 
         cmd = [
             self.browser_exe,
@@ -71,7 +83,7 @@ class DebugBrowser:
             cmd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            creationflags=subprocess.CREATE_NO_WINDOW,
+            creationflags=_NO_WINDOW,
         )
 
         if not self._wait_for_port(self.cdp_port, timeout=15):
@@ -103,19 +115,52 @@ class DebugBrowser:
         log.info("Playwright connected via CDP. Pages: %d", len(self._context.pages))
         return self._context
 
+    def pages(self) -> list[Page]:
+        """Every open page, across every context of the attached browser."""
+        found: list[Page] = []
+        contexts = []
+        if self._browser is not None:
+            try:
+                contexts = list(self._browser.contexts)
+            except PlaywrightError:
+                contexts = []
+        if not contexts and self._context is not None:
+            contexts = [self._context]
+        for context in contexts:
+            try:
+                found.extend(context.pages)
+            except PlaywrightError:
+                continue
+        return found
+
     def find_page_by_url(self, url_pattern: str, timeout: int = 30) -> Page | None:
         """Poll pages until one matches the URL pattern."""
-        import re
         pattern = re.compile(url_pattern, re.IGNORECASE)
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            for page in self._context.pages:
-                if pattern.search(page.url):
-                    log.info("Found matching page: %s", page.url)
+            for page in self.pages():
+                try:
+                    url = page.url
+                except PlaywrightError:
+                    continue
+                if pattern.search(url):
+                    log.info("Found matching page: %s", url)
+                    try:
+                        page.bring_to_front()
+                    except PlaywrightError:
+                        pass
                     return page
             time.sleep(1)
         log.warning("No page matching '%s' found within %ds.", url_pattern, timeout)
         return None
+
+    def open_url(self, url: str, timeout: int = 30) -> Page:
+        """Open a URL in a new tab of the controlled browser."""
+        if self._context is None:
+            raise RuntimeError("connect() must be called before open_url()")
+        page = self._context.new_page()
+        page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
+        return page
 
     def close(self) -> None:
         """Clean up: close Playwright, kill browser, remove temp dir."""
@@ -150,7 +195,7 @@ class DebugBrowser:
             result = subprocess.run(
                 ["netstat", "-ano", "-p", "tcp"],
                 capture_output=True, text=True, timeout=5,
-                creationflags=subprocess.CREATE_NO_WINDOW,
+                creationflags=_NO_WINDOW,
             )
             for line in result.stdout.splitlines():
                 if f":{self.cdp_port}" in line and "LISTENING" in line:
@@ -159,7 +204,7 @@ class DebugBrowser:
                     if pid.isdigit():
                         subprocess.run(["taskkill", "/F", "/PID", pid],
                                        capture_output=True, timeout=5,
-                                       creationflags=subprocess.CREATE_NO_WINDOW)
+                                       creationflags=_NO_WINDOW)
                         log.info("Killed lingering browser PID %s on port %d", pid, self.cdp_port)
         except Exception as exc:
             log.debug("Port cleanup failed (non-fatal): %s", exc)
